@@ -8,7 +8,7 @@ from playwright.async_api import Page
 from .base import BaseScraper
 from ..models import Person, Experience, Education, Accomplishment, Interest, Contact
 from ..callbacks import ProgressCallback, SilentCallback
-from ..core.exceptions import ScrapingError
+from ..core.exceptions import RateLimitError, ScrapingError
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,10 @@ class PersonScraper(BaseScraper):
 
             # Wait for main content
             await self.page.wait_for_selector("main", timeout=10000)
+            try:
+                await self.page.wait_for_selector("h1", timeout=10000, state="visible")
+            except Exception:
+                pass
             await self.wait_and_focus(1)
 
             # Get name and location
@@ -106,16 +110,49 @@ class PersonScraper(BaseScraper):
             return person
 
         except Exception as e:
+            if isinstance(e, RateLimitError):
+                await self.callback.on_error(e)
+                raise
             await self.callback.on_error(e)
             raise ScrapingError(f"Failed to scrape person profile: {e}")
 
     async def _get_name_and_location(self) -> tuple[str, Optional[str]]:
         """Extract name and location from profile."""
         try:
-            name = await self.safe_extract_text("h1", default="Unknown")
+            name = await self.safe_extract_text("main h1", default="")
+            if not name:
+                name = await self.safe_extract_text("h1", default="")
+            if not name:
+                name = await self.get_attribute_safe('meta[property="og:title"]', "content", default="")
+                if name and " | LinkedIn" in name:
+                    name = name.split(" | LinkedIn", 1)[0].strip()
+            if not name:
+                # Fallback to page title if available (e.g., "Bill Gates | LinkedIn")
+                try:
+                    title = await self.page.title()
+                    if title and "|" in title:
+                        name = title.split("|")[0].strip()
+                    elif title:
+                        name = title.strip()
+                except Exception:
+                    name = "Unknown"
+
             location = await self.safe_extract_text(
-                ".text-body-small.inline.t-black--light.break-words", default=""
+                "main .text-body-small.inline.t-black--light.break-words",
+                default="",
             )
+            if not location:
+                location = await self.safe_extract_text(
+                    "main .pv-text-details__left-panel .text-body-small",
+                    default="",
+                )
+            if not location:
+                location = await self.safe_extract_text(
+                    "main [class*='text-body-small']",
+                    default="",
+                )
+            if location:
+                location = location.split("\n")[0].strip()
             return name, location if location else None
         except Exception as e:
             logger.warning(f"Error getting name/location: {e}")
@@ -137,7 +174,7 @@ class PersonScraper(BaseScraper):
         try:
             # Find the profile card that contains "About"
             profile_cards = await self.page.locator(
-                '[data-view-name="profile-card"]'
+                '[data-view-name="profile-card"], section'
             ).all()
 
             for card in profile_cards:
@@ -151,6 +188,16 @@ class PersonScraper(BaseScraper):
                         about_text = await about_spans[1].text_content()
                         return about_text.strip() if about_text else None
 
+            about_heading = self.page.locator('h2:has-text("About")').first
+            if await about_heading.count() > 0:
+                about_section = about_heading.locator('xpath=ancestor::section[1]')
+                if await about_section.count() > 0:
+                    about_text = await about_section.inner_text()
+                    if about_text:
+                        lines = [line.strip() for line in about_text.splitlines() if line.strip()]
+                        if len(lines) > 1:
+                            return " ".join(lines[1:]).strip()
+
             return None
         except Exception as e:
             logger.debug(f"Error getting about section: {e}")
@@ -161,7 +208,9 @@ class PersonScraper(BaseScraper):
         experiences = []
 
         try:
-            experience_heading = self.page.locator('h2:has-text("Experience")').first
+            experience_heading = self.page.locator(
+                'h2:has-text("Experience"), span:has-text("Experience")'
+            ).first
             
             if await experience_heading.count() > 0:
                 experience_section = experience_heading.locator('xpath=ancestor::*[.//ul or .//ol][1]')
@@ -179,7 +228,30 @@ class PersonScraper(BaseScraper):
                         except Exception as e:
                             logger.debug(f"Error parsing experience from main page: {e}")
                             continue
+            if not experiences:
+                main_element = self.page.locator('main')
+                if await main_element.count() > 0:
+                    fallback_items = await main_element.locator(
+                        'div[data-view-name="profile-component-entity"], ul > li, ol > li'
+                    ).all()
+                    for item in fallback_items:
+                        try:
+                            exp = await self._parse_main_page_experience(item)
+                            if exp:
+                                experiences.append(exp)
+                        except Exception as e:
+                            logger.debug(f"Error parsing fallback experience: {e}")
+                            continue
             
+            if not experiences:
+                # Try heuristic fallback extraction from page content before hitting details URL
+                try:
+                    fallback = await self._fallback_extract_experiences()
+                    if fallback:
+                        experiences.extend(fallback)
+                except Exception:
+                    pass
+
             if not experiences:
                 exp_url = urljoin(base_url, "details/experience")
                 await self.navigate_and_wait(exp_url)
@@ -216,6 +288,72 @@ class PersonScraper(BaseScraper):
             logger.warning(
                 f"Error getting experiences: {e}. The experience section may not be available or the page structure has changed."
             )
+
+        return experiences
+
+    async def _fallback_extract_experiences(self) -> list[Experience]:
+        """Attempt to heuristically extract experiences from generic list items on the page."""
+        experiences = []
+        try:
+            main_element = self.page.locator('main')
+            if await main_element.count() == 0:
+                main_element = self.page
+
+            items = await main_element.locator('li, .pv-entity__position-group-pager, .pvs-list__paged-list-item').all()
+            seen = set()
+            for item in items:
+                try:
+                    text = (await item.inner_text()) or ""
+                    text = " ".join([ln.strip() for ln in text.splitlines() if ln.strip()])
+                    if not text or len(text) < 10:
+                        continue
+
+                    # simple heuristic: must contain a year or 'Present' or 'yrs' or '·'
+                    if any(tok in text for tok in ["Present", "present", "yrs", "yr", "mo", "·"]) or any(c.isdigit() for c in text):
+                        # split into lines to get title/company
+                        parts = [p.strip() for p in text.split('\n') if p.strip()]
+                        if len(parts) >= 2:
+                            position_title = parts[0]
+                            company_name = parts[1]
+                        else:
+                            # fallback split by ' at '
+                            if ' at ' in parts[0]:
+                                pcomp = parts[0].split(' at ', 1)
+                                position_title = pcomp[0].strip()
+                                company_name = pcomp[1].strip()
+                            else:
+                                # skip if cannot parse
+                                continue
+
+                        key = (position_title, company_name)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+
+                        # try to find date substring
+                        from_date = to_date = duration = None
+                        for token in ['Present', 'present', '·', 'yrs', 'yr', 'mo']:
+                            if token in text:
+                                # naive extract: take substring containing token
+                                duration = token
+                                break
+
+                        experiences.append(
+                            Experience(
+                                position_title=position_title,
+                                institution_name=company_name,
+                                linkedin_url=None,
+                                from_date=from_date,
+                                to_date=to_date,
+                                duration=duration,
+                                location=None,
+                                description=None,
+                            )
+                        )
+                except Exception:
+                    continue
+        except Exception:
+            return []
 
         return experiences
     
@@ -523,7 +661,9 @@ class PersonScraper(BaseScraper):
         educations = []
 
         try:
-            education_heading = self.page.locator('h2:has-text("Education")').first
+            education_heading = self.page.locator(
+                'h2:has-text("Education"), span:has-text("Education")'
+            ).first
             
             if await education_heading.count() > 0:
                 education_section = education_heading.locator('xpath=ancestor::*[.//ul or .//ol][1]')
@@ -540,6 +680,20 @@ class PersonScraper(BaseScraper):
                                 educations.append(edu)
                         except Exception as e:
                             logger.debug(f"Error parsing education from main page: {e}")
+                            continue
+            if not educations:
+                main_element = self.page.locator('main')
+                if await main_element.count() > 0:
+                    fallback_items = await main_element.locator(
+                        'div[data-view-name="profile-component-entity"], ul > li, ol > li'
+                    ).all()
+                    for item in fallback_items:
+                        try:
+                            edu = await self._parse_main_page_education(item)
+                            if edu:
+                                educations.append(edu)
+                        except Exception as e:
+                            logger.debug(f"Error parsing fallback education: {e}")
                             continue
             
             if not educations:
@@ -1025,13 +1179,21 @@ class PersonScraper(BaseScraper):
         contacts = []
 
         try:
-            contact_url = urljoin(base_url, "overlay/contact-info/")
-            await self.navigate_and_wait(contact_url)
-            await self.wait_and_focus(1)
+            # Prefer opening the dialog from the profile page itself; LinkedIn often
+            # aborts direct overlay navigations even when the page is valid.
+            contact_trigger = self.page.locator(
+                'a:has-text("Contact info"), button:has-text("Contact info")'
+            ).first
+            if await contact_trigger.count() > 0:
+                try:
+                    await contact_trigger.click()
+                    await self.page.wait_for_selector('dialog, [role="dialog"]', timeout=5000)
+                except Exception as click_error:
+                    logger.debug(f"Could not open contact info dialog from page: {click_error}")
 
             dialog = self.page.locator('dialog, [role="dialog"]').first
             if await dialog.count() == 0:
-                logger.warning("Contact info dialog not found")
+                logger.debug("Contact info dialog not found; skipping contacts")
                 return contacts
 
             contact_sections = await dialog.locator('h3').all()
