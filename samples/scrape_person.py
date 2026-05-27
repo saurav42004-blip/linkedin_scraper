@@ -8,6 +8,7 @@ import asyncio
 from linkedin_scraper.scrapers.person import PersonScraper
 from linkedin_scraper.core.browser import BrowserManager
 from linkedin_scraper.core.exceptions import RateLimitError, ScrapingError
+from linkedin_scraper import wait_for_manual_login
 
 
 async def main():
@@ -18,7 +19,7 @@ async def main():
     # Initialize and start browser using context manager
     async with BrowserManager(
         headless=False,
-        slow_mo=50,
+        slow_mo=250,
         user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
         ) as browser:
 
@@ -26,12 +27,17 @@ async def main():
         # Load existing session (must be created first - see README for setup)
         await browser.load_session("linkedin_session.json")
         print("✓ Session loaded")
+
+        # Warm up session with gentle navigation to reduce challenge likelihood
+        await browser.page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
+        await asyncio.sleep(3)
         
         # Initialize scraper with the browser page
         scraper = PersonScraper(browser.page)
         
         # Scrape the profile
         print(f"🚀 Scraping: {profile_url}")
+        await asyncio.sleep(2)
         try:
             person = await scraper.scrape(profile_url)
         except RateLimitError as e:
@@ -40,8 +46,20 @@ async def main():
             print("Try again later, use a different profile, or complete manual verification in the browser.")
             return
         except ScrapingError as e:
-            print(f"\n❌ Scraping failed: {e}")
-            return
+            if "Not logged in" in str(e):
+                print("\n⚠️ Session expired or invalid. Please log in manually in the opened browser...")
+                await browser.page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded")
+                try:
+                    await wait_for_manual_login(browser.page, timeout=300000)
+                    await browser.save_session("linkedin_session.json")
+                    print("✓ Session refreshed. Retrying scrape...")
+                    person = await scraper.scrape(profile_url)
+                except Exception as login_err:
+                    print(f"\n❌ Manual login/refresh failed: {login_err}")
+                    return
+            else:
+                print(f"\n❌ Scraping failed: {e}")
+                return
         
         # Display results
         print("\n" + "="*60)
